@@ -40,7 +40,7 @@ pub fn update_graph(
     let mut core = core_ref.get_mut();
     let mut new_tasks = Vec::with_capacity(update.tasks.len());
 
-    let mut new_task_ids: Map<DaskKey, TaskId> = Default::default();
+    let mut new_task_ids: Map<DaskKey, TaskId> = Map::with_capacity(update.tasks.len());
 
     let lowest_id = core.new_task_id();
     for (task_key, _) in &update.tasks {
@@ -53,6 +53,7 @@ pub fn update_graph(
         client_id
     );
 
+    let mut dependency_count = 0;
     for (task_key, task_spec) in update.tasks {
         let task_id = *new_task_ids.get(&task_key).unwrap();
         let inputs = if let Some(deps) = update.dependencies.get(&task_key) {
@@ -71,6 +72,8 @@ pub fn update_graph(
         } else {
             Vec::new()
         };
+        dependency_count += inputs.len() + 1;
+
         let unfinished_deps = inputs
             .iter()
             .map(|task_id| {
@@ -102,10 +105,11 @@ pub fn update_graph(
     let is_actor = update.actors.unwrap_or(false);
 
     /* Send notification in topological ordering of tasks */
-    let mut notifications = Notifications::default();
-    let mut processed = Set::new();
-    let mut stack: Vec<(TaskRef, usize)> = Vec::new();
     let mut count = new_tasks.len();
+    let mut notifications = Notifications::with_scheduler_capacity(count);
+    let mut processed = Set::new();
+    let mut stack: Vec<(TaskRef, usize)> = Vec::with_capacity(dependency_count);
+
     for task_ref in new_tasks {
         if !task_ref.get().has_consumers() {
             stack.push((task_ref, 0));
@@ -116,8 +120,7 @@ pub fn update_graph(
                 };
                 if let Some(inp) = ii {
                     stack.push((tr, c + 1));
-                    if inp > lowest_id && !processed.contains(&inp) {
-                        processed.insert(inp);
+                    if inp > lowest_id && processed.insert(inp) {
                         stack.push((core.get_task_by_id_or_panic(inp).clone(), 0));
                     }
                 } else {

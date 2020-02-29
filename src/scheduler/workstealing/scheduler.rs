@@ -13,12 +13,13 @@ use rand::rngs::ThreadRng;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::time::Duration;
+use crate::scheduler::workstealing::task::CyclicTaskRef;
 
 #[derive(Debug)]
 pub struct Scheduler {
     network_bandwidth: f32,
     workers: Map<WorkerId, WorkerRef>,
-    tasks: Map<TaskId, TaskRef>,
+    tasks: Map<TaskId, CyclicTaskRef>,
     ready_to_assign: Vec<TaskRef>,
     new_tasks: Vec<TaskRef>,
     hostnames: Map<String, HostnameId>,
@@ -328,7 +329,7 @@ impl Scheduler {
                         .iter()
                         .map(|id| self.tasks.get(id).unwrap().clone())
                         .collect();
-                    let task = TaskRef::new(ti, inputs);
+                    let task = CyclicTaskRef::new(ti, inputs);
                     if task.get().is_ready() {
                         log::debug!("Task {} is ready", task_id);
                         self.ready_to_assign.push(task.clone());
@@ -341,7 +342,7 @@ impl Scheduler {
                     log::debug!("Remove task {}", task_id);
                     {
                         let tref = self.get_task(task_id);
-                        let task = tref.get();
+                        let task = tref.get_mut();
                         assert!(task.is_finished()); // TODO: Define semantics of removing non-finished tasks
                     }
                     assert!(self.tasks.remove(&task_id).is_some());
@@ -353,7 +354,7 @@ impl Scheduler {
                         .map(|id| self.get_worker(*id).clone())
                         .collect();
                     let task_id = ti.id;
-                    let task = TaskRef::new_finished(ti, placement);
+                    let task = CyclicTaskRef::new_finished(ti, placement);
                     assert!(self.tasks.insert(task_id, task).is_none());
                 }
                 ToSchedulerMessage::NewWorker(wi) => {

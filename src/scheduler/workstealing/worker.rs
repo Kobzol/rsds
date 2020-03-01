@@ -1,5 +1,4 @@
-use crate::scheduler::schedproto::{WorkerId, WorkerInfo};
-use crate::scheduler::workstealing::task::TaskRef;
+use crate::scheduler::schedproto::{WorkerId, WorkerInfo, TaskId};
 use std::collections::HashSet;
 
 pub type HostnameId = u64;
@@ -9,17 +8,17 @@ pub struct Worker {
     pub id: WorkerId,
     pub ncpus: u32,
     pub hostname_id: HostnameId,
-    pub tasks: HashSet<TaskRef>,
+    pub tasks: HashSet<TaskId>,
 }
 
 impl Worker {
     pub fn sanity_check(&self, worker_ref: &WorkerRef) {
-        for tr in &self.tasks {
+        /*for tr in &self.tasks {
             let task = tr.get();
             assert!(task.is_waiting());
             let wr = task.assigned_worker.as_ref().unwrap();
             assert!(wr.eq(worker_ref));
-        }
+        }*/
     }
 
     #[inline]

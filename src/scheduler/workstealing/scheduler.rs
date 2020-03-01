@@ -1,4 +1,4 @@
-use super::task::{SchedulerTaskState, Task, TaskRef};
+use super::task::{SchedulerTaskState, Task};
 use super::utils::compute_b_level;
 use super::worker::{Worker, WorkerRef, HostnameId};
 use crate::common::{Map, Set};
@@ -13,20 +13,20 @@ use rand::rngs::ThreadRng;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::time::Duration;
-use crate::scheduler::workstealing::task::CyclicTaskRef;
+use crate::scheduler::workstealing::taskmap::TaskMap;
 
 #[derive(Debug)]
 pub struct Scheduler {
     network_bandwidth: f32,
     workers: Map<WorkerId, WorkerRef>,
-    tasks: Map<TaskId, CyclicTaskRef>,
-    ready_to_assign: Vec<TaskRef>,
-    new_tasks: Vec<TaskRef>,
+    tasks: TaskMap,
+    ready_to_assign: Vec<TaskId>,
+    new_tasks: Vec<TaskId>,
     hostnames: Map<String, HostnameId>,
     rng: ThreadRng,
 }
 
-type Notifications = Set<TaskRef>;
+type Notifications = Set<TaskId>;
 
 const MIN_SCHEDULING_DELAY: Duration = Duration::from_millis(15);
 
@@ -43,14 +43,8 @@ impl Scheduler {
         }
     }
 
-    fn get_task(&self, task_id: TaskId) -> &TaskRef {
-        self.tasks
-            .get(&task_id)
-            .unwrap_or_else(|| panic!("Task {} not found", task_id))
-    }
-
-    fn get_worker(&self, worker_id: WorkerId) -> &WorkerRef {
-        self.workers
+    fn get_worker(workers: &Map<WorkerId, WorkerRef>, worker_id: WorkerId) -> &WorkerRef {
+        workers
             .get(&worker_id)
             .unwrap_or_else(|| panic!("Worker {} not found", worker_id))
     }
@@ -59,7 +53,7 @@ impl Scheduler {
         let assignments: Vec<_> = notifications
             .into_iter()
             .map(|tr| {
-                let task = tr.get();
+                let task = self.tasks.get_task(tr);
                 let worker_ref = task.assigned_worker.clone().unwrap();
                 let worker = worker_ref.get();
                 TaskAssignment {
@@ -100,24 +94,6 @@ impl Scheduler {
         Ok(())
     }
 
-    fn assign_task_to_worker(
-        &mut self,
-        task: &mut Task,
-        task_ref: TaskRef,
-        worker: &mut Worker,
-        worker_ref: WorkerRef,
-        notifications: &mut Notifications,
-    ) {
-        notifications.insert(task_ref.clone());
-        if let Some(wr) = &task.assigned_worker {
-            assert!(!wr.eq(&worker_ref));
-            let mut previous_worker = wr.get_mut();
-            assert!(previous_worker.tasks.remove(&task_ref));
-        }
-        task.assigned_worker = Some(worker_ref);
-        assert!(worker.tasks.insert(task_ref));
-    }
-
     /// Returns true if balancing is needed.
     pub fn schedule(&mut self, mut notifications: &mut Notifications) -> bool {
         if self.workers.is_empty() {
@@ -127,19 +103,18 @@ impl Scheduler {
         log::debug!("Scheduling started");
         if !self.new_tasks.is_empty() {
             // TODO: utilize information and do not recompute all b-levels
-            compute_b_level(&self.tasks);
+            compute_b_level(&mut self.tasks);
             self.new_tasks = Vec::new()
         }
 
         for tr in std::mem::take(&mut self.ready_to_assign).into_iter() {
-            let mut task = tr.get_mut();
-            let worker_ref = self.choose_worker_for_task(&task);
+            let worker_ref = Scheduler::choose_worker_for_task(&self.workers, &self.tasks, &self.tasks.get_task(tr));
+            let mut task = self.tasks.get_task_mut(tr);
             let mut worker = worker_ref.get_mut();
             log::debug!("Task {} initially assigned to {}", task.id, worker.id);
             assert!(task.assigned_worker.is_none());
-            self.assign_task_to_worker(
-                &mut task,
-                tr.clone(),
+            assign_task_to_worker(
+                task,
                 &mut worker,
                 worker_ref.clone(),
                 &mut notifications,
@@ -163,10 +138,10 @@ impl Scheduler {
             let len = worker.tasks.len() as u32;
             if len > worker.ncpus {
                 log::debug!("Worker {} offers {} tasks", worker.id, len);
-                for tr in &worker.tasks {
-                    tr.get_mut().take_flag = false;
+                for &tr in &worker.tasks {
+                    self.tasks.get_task_mut(tr).take_flag = false;
                 }
-                balanced_tasks.extend(worker.tasks.iter().filter(|tr| !tr.get().pinned).cloned());
+                balanced_tasks.extend(worker.tasks.iter().filter(|tr| !self.tasks.get_task(**tr).pinned).copied());
             }
         }
 
@@ -177,7 +152,7 @@ impl Scheduler {
             if len < worker.ncpus {
                 log::debug!("Worker {} is underloaded ({} tasks)", worker.id, len);
                 let mut ts = balanced_tasks.clone();
-                ts.sort_by_cached_key(|tr| std::u64::MAX - task_transfer_cost(&tr.get(), &wr));
+                ts.sort_by_cached_key(|&tr| std::u64::MAX - task_transfer_cost(&self.tasks, self.tasks.get_task(tr), &wr));
                 underload_workers.push((wr.clone(), ts));
             }
         }
@@ -195,7 +170,7 @@ impl Scheduler {
                     continue;
                 }
                 while let Some(tr) = ts.pop() {
-                    let mut task = tr.get_mut();
+                    let mut task = self.tasks.get_task_mut(tr);
                     if task.take_flag {
                         continue;
                     }
@@ -214,9 +189,8 @@ impl Scheduler {
                         wid,
                         worker.id
                     );
-                    self.assign_task_to_worker(
+                    assign_task_to_worker(
                         &mut task,
-                        tr.clone(),
                         &mut worker,
                         wr.clone(),
                         &mut notifications,
@@ -234,45 +208,52 @@ impl Scheduler {
     }
 
     fn task_update(&mut self, tu: TaskUpdate) -> bool {
-        let tref = self.get_task(tu.id).clone();
-        let mut task = tref.get_mut();
         match tu.state {
             TaskUpdateType::Finished => {
-                log::debug!("Task id={} is finished on worker={}", task.id, tu.worker);
-
-                let worker = self.get_worker(tu.worker).clone();
-                assert!(task.is_waiting() && task.is_ready());
-                task.state = SchedulerTaskState::Finished;
-                task.size = tu.size.unwrap();
-                let wr = task.assigned_worker.take().unwrap();
                 let mut invoke_scheduling = {
-                    let mut worker = wr.get_mut();
-                    assert!(worker.tasks.remove(&tref));
-                    worker.is_underloaded()
+                    let task = self.tasks.get_task_mut(tu.id);
+
+                    log::debug!("Task id={} is finished on worker={}", task.id, tu.worker);
+
+                    let worker = Scheduler::get_worker(&self.workers, tu.worker).clone();
+                    assert!(task.is_waiting() && task.is_ready());
+                    task.state = SchedulerTaskState::Finished;
+                    task.size = tu.size.unwrap();
+                    let wr = task.assigned_worker.take().unwrap();
+                    let mut invoke_scheduling = {
+                        let mut worker = wr.get_mut();
+                        assert!(worker.tasks.remove(&task.id));
+                        worker.is_underloaded()
+                    };
+                    task.placement.insert(worker);
+                    invoke_scheduling
                 };
-                for tref in &task.consumers {
-                    let mut t = tref.get_mut();
+
+                // Borrow checker error
+                for &tref in &self.tasks.get_task(tu.id).consumers {
+                    let mut t = self.tasks.get_task_mut(tref);
                     if t.unfinished_deps <= 1 {
                         assert!(t.unfinished_deps > 0);
                         assert!(t.is_waiting());
                         t.unfinished_deps -= 1;
                         log::debug!("Task {} is ready", t.id);
-                        self.ready_to_assign.push(tref.clone());
+                        self.ready_to_assign.push(tref);
                         invoke_scheduling = true;
                     } else {
                         t.unfinished_deps -= 1;
                     }
                 }
-                task.placement.insert(worker);
                 return invoke_scheduling;
             }
             TaskUpdateType::Placed => {
-                let worker = self.get_worker(tu.worker).clone();
+                let task = self.tasks.get_task_mut(tu.id);
+                let worker = Scheduler::get_worker(&self.workers, tu.worker).clone();
                 assert!(task.is_finished());
                 task.placement.insert(worker);
             }
             TaskUpdateType::Removed => {
-                let worker = self.get_worker(tu.worker);
+                let task = self.tasks.get_task_mut(tu.id);
+                let worker = Scheduler::get_worker(&self.workers, tu.worker);
                 //task.placement.remove(worker);
                 if !task.placement.remove(worker) {
                     panic!(
@@ -289,9 +270,8 @@ impl Scheduler {
     }
 
     fn rollback_steal(&mut self, response: TaskStealResponse) -> bool {
-        let tref = self.get_task(response.id);
-        let mut task = tref.get_mut();
-        let new_wref = self.get_worker(response.to_worker);
+        let mut task = self.tasks.get_task_mut(response.id);
+        let new_wref = Scheduler::get_worker(&self.workers, response.to_worker);
 
         let need_balancing = {
             let wref = task.assigned_worker.as_ref().unwrap();
@@ -299,13 +279,13 @@ impl Scheduler {
                 return false;
             }
             let mut worker = wref.get_mut();
-            worker.tasks.remove(&tref);
+            worker.tasks.remove(&task.id);
             worker.is_underloaded()
         };
         task.pinned = true;
         task.assigned_worker = Some(new_wref.clone());
         let mut new_worker = new_wref.get_mut();
-        new_worker.tasks.insert(tref.clone());
+        new_worker.tasks.insert(task.id);
         need_balancing
     }
 
@@ -324,38 +304,29 @@ impl Scheduler {
                 ToSchedulerMessage::NewTask(ti) => {
                     log::debug!("New task {} #inputs={}", ti.id, ti.inputs.len());
                     let task_id = ti.id;
-                    let inputs: Vec<_> = ti
-                        .inputs
-                        .iter()
-                        .map(|id| self.tasks.get(id).unwrap().clone())
-                        .collect();
-                    let task = CyclicTaskRef::new(ti, inputs);
-                    if task.get().is_ready() {
+                    let task = self.tasks.new_task(ti);
+                    if task.is_ready() {
                         log::debug!("Task {} is ready", task_id);
-                        self.ready_to_assign.push(task.clone());
+                        self.ready_to_assign.push(task.id);
                     }
-                    self.new_tasks.push(task.clone());
-                    assert!(self.tasks.insert(task_id, task).is_none());
+                    self.new_tasks.push(task.id);
                     invoke_scheduling = true;
                 }
                 ToSchedulerMessage::RemoveTask(task_id) => {
                     log::debug!("Remove task {}", task_id);
                     {
-                        let tref = self.get_task(task_id);
-                        let task = tref.get_mut();
+                        let task = self.tasks.get_task(task_id);
                         assert!(task.is_finished()); // TODO: Define semantics of removing non-finished tasks
                     }
-                    assert!(self.tasks.remove(&task_id).is_some());
+                    self.tasks.remove_task(task_id);
                 }
                 ToSchedulerMessage::NewFinishedTask(ti) => {
                     let placement: Set<WorkerRef> = ti
                         .workers
                         .iter()
-                        .map(|id| self.get_worker(*id).clone())
+                        .map(|id| Scheduler::get_worker(&self.workers, *id).clone())
                         .collect();
-                    let task_id = ti.id;
-                    let task = CyclicTaskRef::new_finished(ti, placement);
-                    assert!(self.tasks.insert(task_id, task).is_none());
+                    self.tasks.new_finished_task(ti, placement);
                 }
                 ToSchedulerMessage::NewWorker(wi) => {
                     let hostname_id = self.get_hostname_id(&wi.hostname);
@@ -375,11 +346,12 @@ impl Scheduler {
         *self.hostnames.entry(hostname.to_owned()).or_insert(new_id)
     }
 
-    fn choose_worker_for_task(&mut self, task: &Task) -> WorkerRef {
+    fn choose_worker_for_task(worker_map: &Map<WorkerId, WorkerRef>, tasks: &TaskMap, task: &Task) -> WorkerRef {
+        let mut rng = thread_rng();
         let mut costs = std::u64::MAX;
         let mut workers = Vec::new();
-        for wr in self.workers.values() {
-            let c = task_transfer_cost(task, wr);
+        for wr in worker_map.values() {
+            let c = task_transfer_cost(&tasks, task, wr);
             if c < costs {
                 costs = c;
                 workers.clear();
@@ -391,12 +363,12 @@ impl Scheduler {
         if workers.len() == 1 {
             workers.pop().unwrap()
         } else {
-            workers.choose(&mut self.rng).unwrap().clone()
+            workers.choose(&mut rng).unwrap().clone()
         }
     }
 
     pub fn sanity_check(&self) {
-        for (id, tr) in &self.tasks {
+        /*for (id, tr) in &self.tasks {
             let task = tr.get();
             assert_eq!(task.id, *id);
             task.sanity_check(&tr);
@@ -408,17 +380,33 @@ impl Scheduler {
         for wr in self.workers.values() {
             let worker = wr.get();
             worker.sanity_check(&wr);
-        }
+        } TODO*/
     }
 }
 
-fn task_transfer_cost(task: &Task, worker_ref: &WorkerRef) -> u64 {
+fn assign_task_to_worker(
+    task: &mut Task,
+    worker: &mut Worker,
+    worker_ref: WorkerRef,
+    notifications: &mut Notifications,
+) {
+    notifications.insert(task.id);
+    if let Some(wr) = &task.assigned_worker {
+        assert!(!wr.eq(&worker_ref));
+        let mut previous_worker = wr.get_mut();
+        assert!(previous_worker.tasks.remove(&task.id));
+    }
+    task.assigned_worker = Some(worker_ref);
+    assert!(worker.tasks.insert(task.id));
+}
+
+fn task_transfer_cost(tasks: &TaskMap, task: &Task, worker_ref: &WorkerRef) -> u64 {
     // TODO: For large number of inputs, only sample inputs
     task.inputs
         .iter()
         .take(512)
-        .map(|tr| {
-            let t = tr.get();
+        .map(|&tr| {
+            let t = tasks.get_task(tr);
             if t.placement.contains(worker_ref) {
                 0u64
             } else {

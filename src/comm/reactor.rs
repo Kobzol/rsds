@@ -53,7 +53,6 @@ pub fn update_graph(
         client_id
     );
 
-    let mut dependency_count = 0;
     for (task_key, task_spec) in update.tasks {
         let task_id = *new_task_ids.get(&task_key).unwrap();
         let inputs = if let Some(deps) = update.dependencies.get(&task_key) {
@@ -72,7 +71,6 @@ pub fn update_graph(
         } else {
             Vec::new()
         };
-        dependency_count += inputs.len() + 1;
 
         let unfinished_deps = inputs
             .iter()
@@ -108,7 +106,7 @@ pub fn update_graph(
     let mut count = new_tasks.len();
     let mut notifications = Notifications::with_scheduler_capacity(count);
     let mut processed = Set::new();
-    let mut stack: Vec<(TaskRef, usize)> = Vec::with_capacity(dependency_count);
+    let mut stack: Vec<(TaskRef, usize)> = Default::default();
 
     for task_ref in new_tasks {
         if !task_ref.get().has_consumers() {

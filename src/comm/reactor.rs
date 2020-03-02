@@ -27,7 +27,6 @@ use futures::stream::FuturesUnordered;
 use futures::{Sink, SinkExt, StreamExt};
 use rand::seq::SliceRandom;
 use std::iter::FromIterator;
-use tokio::net::TcpStream;
 use crate::trace::trace_task_new;
 
 pub fn update_graph(
@@ -192,7 +191,7 @@ pub fn subscribe_keys(
 
 pub async fn gather<W: Sink<DaskPacket, Error = crate::DsError> + Unpin>(
     core_ref: &CoreRef,
-    _comm_ref: &CommRef,
+    comm_ref: &CommRef,
     address: std::net::SocketAddr,
     sink: &mut W,
     keys: Vec<DaskKey>,
@@ -219,7 +218,7 @@ pub async fn gather<W: Sink<DaskPacket, Error = crate::DsError> + Unpin>(
     let mut worker_futures: FuturesUnordered<_> = FuturesUnordered::from_iter(
         worker_map
             .iter()
-            .map(|(worker, keys)| get_data_from_worker(worker.clone(), &keys)),
+            .map(|(worker, keys)| get_data_from_worker(comm_ref, worker.clone(), &keys)),
     );
 
     while let Some(data) = worker_futures.next().await {
@@ -338,7 +337,7 @@ pub async fn scatter<W: Sink<DaskPacket, Error = crate::DsError> + Unpin>(
         let worker_futures = join_all(
             who_what
                 .into_iter()
-                .map(|(worker, data)| update_data_on_worker(worker.get().address().into(), data)),
+                .map(|(worker, data)| update_data_on_worker(comm_ref, worker.get().address().into(), data)),
         );
         worker_futures
             .await
@@ -380,10 +379,10 @@ pub async fn scatter<W: Sink<DaskPacket, Error = crate::DsError> + Unpin>(
 }
 
 pub async fn get_data_from_worker(
+    comm: &CommRef,
     worker_address: DaskKey,
     keys: &[&str],
 ) -> crate::Result<DaskPacket> {
-    let mut connection = connect_to_worker(worker_address).await?;
     let msg = ToWorkerMessage::GetData(GetDataMsg {
         keys,
         who: None,
@@ -391,7 +390,8 @@ pub async fn get_data_from_worker(
         reply: true,
     });
 
-    let (reader, writer) = connection.split();
+    let connection = comm.get().connect(&worker_address).await?;
+    let (reader, writer) = tokio::io::split(connection);
     let mut writer = asyncwrite_to_sink(writer);
     writer.send(serialize_single_packet(msg)?).await?;
 
@@ -401,15 +401,16 @@ pub async fn get_data_from_worker(
     let response = reader.next().await.unwrap()?;
     writer.send(serialize_single_packet("OK")?).await?;
 
+    comm.get().disconnect(reader.into_inner().unsplit(writer.into_inner()));
+
     Ok(response)
 }
 
 pub async fn update_data_on_worker(
+    comm_ref: &CommRef,
     worker_address: DaskKey,
     data: Map<DaskKey, SerializedMemory>,
 ) -> crate::Result<Map<DaskKey, u64>> {
-    let mut connection = connect_to_worker(worker_address).await?;
-
     let mut builder = MessageBuilder::<ToWorkerMessage>::new();
     let msg = ToWorkerMessage::UpdateData(UpdateDataMsg {
         data: map_to_transport(data, &mut builder),
@@ -418,13 +419,18 @@ pub async fn update_data_on_worker(
     });
     builder.add_message(msg);
 
-    let (reader, writer) = connection.split();
+    let connection = comm_ref.get().connect(&worker_address).await?;
+
+    let (reader, writer) = tokio::io::split(connection);
     let mut writer = asyncwrite_to_sink(writer);
     writer.send(builder.build_single()?).await?;
 
     let mut reader = dask_parse_stream::<UpdateDataResponse, _>(asyncread_to_stream(reader));
     let mut response: Batch<UpdateDataResponse> = reader.next().await.unwrap()?;
     assert_eq!(response[0].status.as_bytes(), b"OK");
+
+    comm_ref.get().disconnect(reader.into_inner().into_inner().unsplit(writer.into_inner()));
+
     Ok(response.pop().unwrap().nbytes)
 }
 
@@ -455,7 +461,7 @@ pub async fn who_has<W: Sink<DaskPacket, Error = crate::DsError> + Unpin>(
 
 pub async fn proxy_to_worker<W: Sink<DaskPacket, Error = crate::DsError> + Unpin>(
     core_ref: &CoreRef,
-    _comm_ref: &CommRef,
+    comm_ref: &CommRef,
     sink: &mut W,
     msg: ProxyMsg,
 ) -> crate::Result<()> {
@@ -467,8 +473,8 @@ pub async fn proxy_to_worker<W: Sink<DaskPacket, Error = crate::DsError> + Unpin
             .address()
             .into()
     };
-    let mut connection = connect_to_worker(worker_address).await?;
-    let (reader, writer) = connection.split();
+    let connection = comm_ref.get().connect(&worker_address).await?;
+    let (reader, writer) = tokio::io::split(connection);
     let mut writer = asyncwrite_to_sink(writer);
     let packet = DaskPacket::from_wrapper(MessageWrapper::Message(msg.msg), msg.frames)?;
     writer.send(packet).await?;
@@ -477,11 +483,7 @@ pub async fn proxy_to_worker<W: Sink<DaskPacket, Error = crate::DsError> + Unpin
     if let Some(packet) = reader.next().await {
         sink.send(packet?).await?;
     }
-    Ok(())
-}
 
-async fn connect_to_worker(address: DaskKey) -> crate::Result<tokio::net::TcpStream> {
-    let address = address.to_string();
-    let address = address.trim_start_matches("tcp://");
-    Ok(TcpStream::connect(address).await?)
+    comm_ref.get().disconnect(reader.into_inner().unsplit(writer.into_inner()));
+    Ok(())
 }

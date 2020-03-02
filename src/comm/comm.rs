@@ -17,11 +17,14 @@ use crate::worker::WorkerRef;
 
 use tokio::sync::mpsc::UnboundedSender;
 use crate::trace::trace_task_send;
+use crate::comm::connection_cache::{ConnectionCacheRef, SharedConnection};
+use crate::protocol::key::DaskKeyRef;
 
 pub type CommRef = WrappedRcRefCell<Comm>;
 
 pub struct Comm {
     sender: UnboundedSender<Vec<ToSchedulerMessage>>,
+    connection_cache: ConnectionCacheRef
 }
 
 impl Comm {
@@ -126,10 +129,19 @@ impl Comm {
     fn send_client_packet(&mut self, client: &mut Client, packet: DaskPacket) -> crate::Result<()> {
         client.send_dask_packet(packet)
     }
+
+    #[inline]
+    pub async fn connect(&self, address: &DaskKeyRef) -> crate::Result<SharedConnection> {
+        self.connection_cache.get_connection(address).await
+    }
+    #[inline]
+    pub fn disconnect(&self, connection: SharedConnection) {
+        self.connection_cache.return_connection(connection)
+    }
 }
 
 impl CommRef {
     pub fn new(sender: UnboundedSender<Vec<ToSchedulerMessage>>) -> Self {
-        Self::wrap(Comm { sender })
+        Self::wrap(Comm { sender, connection_cache: Default::default() })
     }
 }

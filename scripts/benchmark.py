@@ -146,17 +146,23 @@ class DaskCluster:
     def _start_scheduler(self, scheduler):
         binary = normalize_binary(scheduler["binary"])
 
+        env = {
+            "RUST_BACKTRACE": "full"
+        }
+
         args = [binary, "--port", str(self.port)] + list(scheduler.get("args", ()))
         is_rsds = "rsds" in scheduler["name"]
-        if self._trace_scheduler() and is_rsds:
-            args += ["--trace-file", os.path.join(self.workdir, "scheduler.trace")]
+        if self._trace_scheduler():
+            trace_file = os.path.join(self.workdir, "scheduler.trace")
+            if is_rsds:
+                args += ["--trace-file", trace_file]
+            else:
+                env["DASK_TRACE_FILE"] = trace_file
 
         if self._profile_flamegraph() and is_rsds:
             args = ["flamegraph", "-o", os.path.join(self.workdir, "scheduler.svg"), "--"] + args
 
-        self.start(args, name="scheduler", env={
-            "RUST_BACKTRACE": "full"
-        })
+        self.start(args, name="scheduler", env=env)
 
     def _start_workers(self, workers, scheduler_address):
         node_count = workers["nodes"]

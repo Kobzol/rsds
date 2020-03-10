@@ -4,7 +4,7 @@ use crate::scheduler::protocol::{
     SchedulerRegistration, TaskStealResponse, TaskUpdate, TaskUpdateType,
 };
 
-use crate::scheduler::task::{Task, TaskRef, SchedulerTaskState};
+use crate::scheduler::task::{SchedulerTaskState, Task, TaskRef};
 use crate::scheduler::utils::{compute_b_level, task_transfer_cost};
 use crate::scheduler::worker::{Worker, WorkerRef};
 use crate::scheduler::{Scheduler, TaskAssignment, ToSchedulerMessage, WorkerId};
@@ -86,7 +86,13 @@ impl WorkstealingScheduler {
                 for tr in &worker.tasks {
                     tr.get_mut().take_flag = false;
                 }
-                balanced_tasks.extend(worker.tasks.iter().filter(|tr| !tr.get().is_pinned()).cloned());
+                balanced_tasks.extend(
+                    worker
+                        .tasks
+                        .iter()
+                        .filter(|tr| !tr.get().is_pinned())
+                        .cloned(),
+                );
             }
         }
 
@@ -104,7 +110,12 @@ impl WorkstealingScheduler {
                         cost += cost / 8;
                         cost += 10_000_000;
                     }
-                    log::debug!("Transfer cost task={} -> worker={} is {}", task.id, worker.id, cost);
+                    log::debug!(
+                        "Transfer cost task={} -> worker={} is {}",
+                        task.id,
+                        worker.id,
+                        cost
+                    );
                     std::u64::MAX - cost
                 });
                 underload_workers.push((wr.clone(), ts));
@@ -391,9 +402,7 @@ mod tests {
     }
 
     fn run_schedule_get_task_ids(scheduler: &mut WorkstealingScheduler) -> Set<TaskId> {
-        run_schedule(scheduler).iter()
-        .map(|a| a.task)
-        .collect()
+        run_schedule(scheduler).iter().map(|a| a.task).collect()
     }
 
     fn assigned_worker(scheduler: &mut WorkstealingScheduler, task_id: TaskId) -> WorkerId {
@@ -561,8 +570,8 @@ mod tests {
     #[test]
     fn test_many_submits() {
         init();
-        let WORKERS : u32 = 42;
-        let TASKS : usize = 40;
+        const WORKERS: u32 = 42;
+        const TASKS: usize = 40;
         let mut scheduler = WorkstealingScheduler::default();
         connect_workers(&mut scheduler, WORKERS, 1);
         let mut workers: Set<WorkerId> = Set::new();

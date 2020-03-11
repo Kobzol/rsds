@@ -5,7 +5,7 @@ use crate::common::WrappedRcRefCell;
 use crate::protocol::clientmsg::ClientTaskSpec;
 use crate::protocol::key::to_dask_key;
 use crate::protocol::protocol::{
-    deserialize_packet, serialize_single_packet, split_packet_into_parts, Batch, DaskCodec,
+    deserialize_packet, serialize_single_packet, Batch,
     DaskPacket, Frame, FromDaskTransport, SerializedMemory, ToDaskTransport,
 };
 use crate::scheduler::protocol::{TaskAssignment, TaskId};
@@ -24,6 +24,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::codec::{Decoder, Encoder};
+use tokio::runtime::Runtime;
+use crate::protocol::codec::DaskProto;
+use futures::StreamExt;
 
 /// Memory stream for reading and writing at the same time.
 pub struct MemoryStream {
@@ -145,30 +148,30 @@ pub(crate) fn task_assign(core: &mut Core, task: &TaskRef, worker: &WorkerRef) -
 
 pub fn packets_to_bytes(packets: Vec<DaskPacket>) -> crate::Result<Vec<u8>> {
     let mut data = BytesMut::new();
-    let mut codec = DaskCodec::default();
+    /*let mut codec = DaskCodec::default();
     for packet in packets {
         let parts = split_packet_into_parts(packet, 1024);
         for part in parts {
             codec.encode(part, &mut data)?;
         }
-    }
+    }*/
     Ok(data.to_vec())
 }
 pub fn msg_to_bytes<T: ToDaskTransport>(item: T) -> crate::Result<Vec<u8>> {
     let packet = serialize_single_packet(item)?;
     let mut data = BytesMut::new();
 
-    let parts = split_packet_into_parts(packet, 1024);
+    /*let parts = split_packet_into_parts(packet, 1024);
     let mut codec = DaskCodec::default();
     for part in parts {
         codec.encode(part, &mut data)?;
-    }
+    }*/
 
     Ok(data.to_vec())
 }
-pub fn bytes_to_msg<T: FromDaskTransport>(data: &[u8]) -> crate::Result<Batch<T>> {
+pub async fn bytes_to_msg<T: FromDaskTransport>(data: &[u8]) -> crate::Result<Batch<T>> {
     let mut bytes = BytesMut::from(data);
-    let packet = DaskCodec::default().decode(&mut bytes)?.unwrap();
+    let packet = DaskProto::new(Cursor::new(bytes)).next().await.unwrap()?;
     deserialize_packet(packet)
 }
 pub fn packet_to_msg<T: FromDaskTransport>(packet: DaskPacket) -> crate::Result<Batch<T>> {

@@ -4,7 +4,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
 
-use crate::protocol::protocol::DaskPacketPart::{HeaderPart, PayloadPart};
 use crate::trace::{trace_packet_receive, trace_packet_send};
 use crate::util::{OptionExt, ResultExt};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -17,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use bytes::buf::BufMutExt;
+use crate::protocol::codec::DaskProto;
 
 /// Commonly used types
 pub type Frame = BytesMut;
@@ -82,150 +82,6 @@ impl DaskPacket {
     }
     pub fn header_bytes(&self) -> usize {
         (self.frame_count() + 1) * 8 // size for each frame + number of frames
-    }
-}
-
-const WRITE_BUFFER_SIZE: usize = 32 * 1024;
-const READ_BUFFER_SIZE: usize = 64 * 1024;
-
-#[derive(Default)]
-struct CodecDecoder {
-    frame_index: usize,
-    main_message: Frame,
-    other_messages: Frames,
-}
-
-/// Encoder/decoder
-#[derive(Default)]
-pub struct DaskCodec {
-    sizes: Option<(u64, Vec<u64>)>,
-    decoder: CodecDecoder
-}
-
-pub enum DaskPacketPart {
-    HeaderPart {
-        frame_sizes: Vec<usize>,
-        views: Vec<Bytes>,
-        max_part_size: usize,
-    },
-    PayloadPart {
-        views: Vec<Bytes>,
-        max_part_size: usize,
-    },
-}
-
-impl Decoder for DaskCodec {
-    type Item = DaskPacket;
-    type Error = crate::DsError;
-
-    fn decode(&mut self, src: &mut BytesMut) -> crate::Result<Option<Self::Item>> {
-        let src = if self.sizes.is_none() {
-            let size = src.len() as u64;
-            if size < 8 {
-                return Ok(None);
-            }
-            let mut cursor = std::io::Cursor::new(src);
-            // Following read_u64 cannot failed, hence do not propagate and leave .unwrap() here
-            let count: u64 = cursor.read_u64::<Endianness>().ensure();
-            let header_size = (count + 1) * 8;
-            if size < header_size {
-                return Ok(None);
-            }
-            let first_size = cursor.read_u64::<Endianness>().ensure();
-            assert_eq!(first_size, 0);
-            let main_size = cursor.read_u64::<Endianness>().ensure();
-            let mut total_size: u64 = main_size;
-            let mut sizes = Vec::new();
-            for _ in 2..count {
-                let size = cursor.read_u64::<Endianness>().ensure();
-                total_size += size;
-                sizes.push(size);
-            }
-            trace_packet_receive(total_size as usize);
-
-            // preallocate space
-            std::mem::replace(&mut self.decoder.main_message, BytesMut::with_capacity(main_size as usize));
-            self.decoder.other_messages.clear();
-            for size in &sizes {
-                self.decoder.other_messages.push(BytesMut::with_capacity(*size as usize));
-            }
-            self.decoder.frame_index = 0;
-
-            self.sizes = Some((main_size, sizes));
-            let src = cursor.into_inner();
-            src.advance(header_size as usize);
-            src
-        } else {
-            src
-        };
-        let max_part_size = READ_BUFFER_SIZE;
-
-        loop {
-            let remaining = src.len();
-            if remaining == 0 {
-                src.reserve(max_part_size);
-                return Ok(None);
-            }
-            let buffer = match self.decoder.frame_index {
-                0 => &mut self.decoder.main_message,
-                index => &mut self.decoder.other_messages[index - 1]
-            };
-            let buf_remaining = buffer.capacity() - buffer.len();
-            let to_copy = std::cmp::min(remaining, buf_remaining);
-            buffer.put_slice(&src.bytes()[..to_copy]);
-            src.advance(to_copy);
-            if buffer.len() == buffer.capacity() {
-                if self.decoder.frame_index == self.decoder.other_messages.len() {
-                    self.sizes = None;
-                    return Ok(Some(DaskPacket {
-                        main_frame: std::mem::take(&mut self.decoder.main_message),
-                        additional_frames: std::mem::take(&mut self.decoder.other_messages)
-                    }))
-                } else {
-                    self.decoder.frame_index += 1;
-                }
-            }
-        }
-    }
-}
-impl Encoder for DaskCodec {
-    type Item = DaskPacketPart;
-    type Error = crate::DsError;
-
-    fn encode(&mut self, data: Self::Item, dst: &mut BytesMut) -> crate::Result<()> {
-        let views = match data {
-            DaskPacketPart::HeaderPart {
-                frame_sizes,
-                views,
-                max_part_size,
-            } => {
-                let frames = frame_sizes.len();
-                let payload_size = frame_sizes.iter().sum::<usize>();
-                let byte_count = (frames + 1) * 8 + payload_size;
-
-                trace_packet_send(byte_count);
-
-                dst.reserve(max_part_size);
-                dst.put_u64_le(frames as u64);
-                for size in frame_sizes {
-                    dst.put_u64_le(size as u64);
-                }
-
-                views
-            }
-            DaskPacketPart::PayloadPart {
-                views,
-                max_part_size,
-            } => {
-                dst.reserve(max_part_size);
-                views
-            }
-        };
-
-        for view in views {
-            dst.extend_from_slice(&view);
-        }
-        Ok(())
     }
 }
 
@@ -431,59 +287,6 @@ impl<T: Serialize> MessageBuilder<T> {
     }
 }
 
-pub fn split_packet_into_parts(packet: DaskPacket, max_part_size: usize) -> Vec<DaskPacketPart> {
-    let size = packet.total_bytes();
-
-    let part_count = ((size as f64) / (max_part_size as f64)).ceil() as usize;
-    let mut parts = Vec::with_capacity(part_count);
-
-    let mut frame_sizes = Vec::with_capacity(packet.frame_count());
-    frame_sizes.push(0);
-    frame_sizes.push(packet.main_frame.len());
-    frame_sizes.extend(packet.additional_frames.iter().map(|f| f.len()));
-
-    let header_bytes = packet.header_bytes();
-    let DaskPacket { main_frame, mut additional_frames } = packet;
-
-    let mut current_view = main_frame.freeze();
-    let mut frame_index = 0;
-
-    for i in 0..part_count {
-        let mut views = vec![];
-        let mut limit = if i == 0 { header_bytes } else { 0 };
-        assert!(limit <= max_part_size);
-
-        while limit < max_part_size {
-            if current_view.is_empty() {
-                if frame_index >= additional_frames.len() {
-                    break;
-                }
-                current_view = std::mem::take(&mut additional_frames[frame_index]).freeze();
-                frame_index += 1;
-            }
-
-            let remaining = std::cmp::min(max_part_size - limit, current_view.len());
-            views.push(current_view.split_to(remaining));
-            limit += remaining;
-        }
-
-        if i == 0 {
-            parts.push(HeaderPart {
-                frame_sizes: std::mem::take(&mut frame_sizes),
-                views,
-                max_part_size,
-            });
-        } else {
-            parts.push(PayloadPart {
-                views,
-                max_part_size,
-            });
-        }
-    }
-
-    parts
-}
-
 fn parse_packet<T: FromDaskTransport>(
     packet: crate::Result<DaskPacket>,
 ) -> crate::Result<Batch<T>> {
@@ -510,37 +313,19 @@ fn parse_packet<T: FromDaskTransport>(
     }
 }
 
-pub fn asyncread_to_stream<R: AsyncRead>(stream: R) -> FramedRead<R, DaskCodec> {
-    FramedRead::new(stream, DaskCodec::default())
+pub fn asyncread_to_stream<R: AsyncRead>(stream: R) -> DaskProto<R> {
+    DaskProto::new(stream)
 }
 pub fn dask_parse_stream<T: FromDaskTransport, R: AsyncRead>(
-    stream: FramedRead<R, DaskCodec>,
-) -> Map<FramedRead<R, DaskCodec>, impl Fn(crate::Result<DaskPacket>) -> crate::Result<Batch<T>>> {
+    stream: DaskProto<R>,
+) -> Map<DaskProto<R>, impl Fn(crate::Result<DaskPacket>) -> crate::Result<Batch<T>>> {
     stream.map(parse_packet)
-}
-
-pub trait IntoInner<T> {
-    fn into_inner(self) -> T;
-}
-
-impl<Si, Item, U, St, F> IntoInner<Si> for WithFlatMap<Si, Item, U, St, F>
-where
-    Si: Sink<Item>,
-    F: FnMut(U) -> St,
-    St: Stream<Item = Result<Item, Si::Error>>,
-{
-    fn into_inner(self) -> Si {
-        WithFlatMap::<Si, Item, U, St, F>::into_inner(self)
-    }
 }
 
 pub fn asyncwrite_to_sink<W: AsyncWrite>(
     sink: W,
-) -> impl Sink<DaskPacket, Error = crate::DsError> + IntoInner<FramedWrite<W, DaskCodec>> {
-    FramedWrite::new(sink, DaskCodec::default()).with_flat_map(|packet| {
-        let parts = split_packet_into_parts(packet, WRITE_BUFFER_SIZE);
-        futures::stream::iter(parts.into_iter().map(|p| Ok(p)))
-    })
+) -> DaskProto<W> {
+    DaskProto::new(sink)
 }
 
 pub fn serialize_single_packet<T: ToDaskTransport>(item: T) -> crate::Result<DaskPacket> {
@@ -571,22 +356,22 @@ mod tests {
         UpdateGraphMsg,
     };
     use crate::protocol::protocol::{
-        asyncwrite_to_sink, serialize_single_packet, split_packet_into_parts, Batch, DaskCodec,
-        DaskPacket, DaskPacketPart, SerializedMemory, Frame
+        asyncwrite_to_sink, serialize_single_packet, Batch,
+        DaskPacket, SerializedMemory, Frame
     };
     use crate::Result;
     use bytes::{Buf, BufMut, BytesMut};
-    use futures::SinkExt;
+    use futures::{SinkExt, StreamExt};
     use maplit::hashmap;
 
     use crate::common::Map;
     use crate::protocol::key::{to_dask_key, DaskKey};
-    use crate::protocol::protocol::IntoInner;
     use crate::test_util::{bytes_to_msg, load_bin_test_data};
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
     use std::io::Cursor;
     use tokio_util::codec::{Decoder, Encoder};
+    use crate::protocol::codec::DaskProto;
 
     impl Clone for DaskPacket {
         fn clone(&self) -> Self {
@@ -605,8 +390,8 @@ mod tests {
         buf.put_u64_le(1);
         buf.put_u8(137u8);
 
-        let mut codec = DaskCodec::default();
-        let packet = codec.decode(&mut buf).unwrap().unwrap();
+        let mut codec = DaskProto::new(Cursor::new(buf));
+        let packet = codec.next().await.unwrap()?;
         assert_eq!(packet.main_frame.to_vec(), vec!(137u8));
         assert!(packet.additional_frames.is_empty());
         Ok(())
@@ -632,9 +417,9 @@ mod tests {
             );
         }
 
-        let mut codec = DaskCodec::default();
+        let mut codec = DaskProto::new(Cursor::new(buf));
 
-        let packet = codec.decode(&mut buf)?.unwrap();
+        let packet = codec.next().await.unwrap()?;
         assert_eq!(packet.main_frame.to_vec(), vec!(137u8));
         assert_eq!(packet.additional_frames.len(), sizes.len());
         for (size, frame) in sizes.into_iter().zip(packet.additional_frames.into_iter()) {
@@ -654,11 +439,10 @@ mod tests {
     async fn write_message_simple() -> Result<()> {
         let bytes: Vec<u8> = vec![1, 2, 3];
         let message = create_packet(&bytes, &Default::default());
-        let mut res = BytesMut::new();
+        let mut res = Vec::new();
 
-        let mut codec = DaskCodec::default();
-        let mut parts = split_packet_into_parts(message, 1024);
-        codec.encode(parts.pop().unwrap(), &mut res)?;
+        let mut codec = DaskProto::new(Cursor::new(&mut res));
+        codec.send(message).await?;
 
         let mut expected = BytesMut::new();
         expected.put_u64_le(2);
@@ -674,11 +458,10 @@ mod tests {
         let bytes: Vec<u8> = vec![1, 2, 3];
         let frames: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![4, 5, 6]];
         let message = create_packet(&bytes, &frames);
-        let mut res = BytesMut::new();
+        let mut res = Vec::new();
 
-        let mut codec = DaskCodec::default();
-        let mut parts = split_packet_into_parts(message, 1024);
-        codec.encode(parts.pop().unwrap(), &mut res)?;
+        let mut codec = DaskProto::new(Cursor::new(&mut res));
+        codec.send(message).await?;
 
         let mut expected = BytesMut::new();
         expected.put_u64_le((2 + frames.len()) as u64);
@@ -695,7 +478,7 @@ mod tests {
 
         Ok(())
     }
-    #[tokio::test]
+    /*#[tokio::test]
     async fn write_message_split() -> Result<()> {
         let bytes: Vec<u8> = vec![8; 100];
         let frames: Vec<Vec<u8>> = vec![vec![3; 16], vec![4; 25]];
@@ -722,9 +505,9 @@ mod tests {
         assert_eq!(res, expected.to_vec());
 
         Ok(())
-    }
+    }*/
 
-    #[test]
+    /*#[test]
     #[should_panic]
     fn split_packet_header_too_large() {
         let packet = create_packet(&vec![1, 2, 3], &Default::default());
@@ -759,12 +542,12 @@ mod tests {
         check_part(&packet, &parts[0], vec![(0, 0, 1), (1, 0, 1)]);
         check_part(&packet, &parts[1], vec![(1, 1, 1), (2, 0, 2), (3, 0, 47)]);
         check_part(&packet, &parts[2], vec![(3, 47, 13)]);
-    }
+    }*/
 
     #[tokio::test]
     async fn parse_update_graph_1() -> Result<()> {
         let mut main: Batch<FromClientMessage> =
-            bytes_to_msg(&load_bin_test_data("data/pandas-update-graph-1.bin"))?;
+            bytes_to_msg(&load_bin_test_data("data/pandas-update-graph-1.bin")).await?;
         assert_eq!(main.len(), 1);
         match main.pop().unwrap() {
             FromClientMessage::UpdateGraph(mut msg) => {
@@ -800,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn parse_update_graph_2() -> Result<()> {
         let mut main: Batch<FromClientMessage> =
-            bytes_to_msg(&load_bin_test_data("data/pandas-update-graph-2.bin"))?;
+            bytes_to_msg(&load_bin_test_data("data/pandas-update-graph-2.bin")).await?;
         assert_eq!(main.len(), 2);
         main.pop().unwrap();
         match main.pop().unwrap() {
@@ -848,7 +631,7 @@ mod tests {
         sink.send(serialize_single_packet(msg)?).await?;
 
         assert_eq!(
-            sink.into_inner().into_inner().into_inner(),
+            sink.into_inner().into_inner(),
             vec![
                 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 38, 0, 0, 0, 0, 0, 0, 0, 131, 162,
                 111, 112, 173, 107, 101, 121, 45, 105, 110, 45, 109, 101, 109, 111, 114, 121, 163,
@@ -877,7 +660,7 @@ mod tests {
         }
     }
 
-    fn check_part(
+    /*fn check_part(
         packet: &DaskPacket,
         part: &DaskPacketPart,
         expected: Vec<(usize, usize, usize)>,
@@ -899,7 +682,7 @@ mod tests {
             orig_view.truncate(len);
             assert_eq!(*view, orig_view);
         }
-    }
+    }*/
 
     fn create_packet(main_frame: &Vec<u8>, additional_frames: &Vec<Vec<u8>>) -> DaskPacket {
         DaskPacket::new(

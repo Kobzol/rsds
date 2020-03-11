@@ -381,7 +381,7 @@ mod tests {
         let (stream, msg_rx) = MemoryStream::new(msg_to_bytes(msg)?);
         let (core, comm, _rx) = dummy_ctx();
         generic_rpc_loop(core, comm, stream, dummy_address()).await?;
-        let res: Batch<IdentityResponse> = bytes_to_msg(&msg_rx.get())?;
+        let res: Batch<IdentityResponse> = bytes_to_msg(&msg_rx.get()).await?;
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].r#type.as_bytes(), b"Scheduler");
 
@@ -401,7 +401,7 @@ mod tests {
         let (stream, msg_rx) = MemoryStream::new(packets_to_bytes(packets)?);
         let (core, comm, _rx) = dummy_ctx();
         generic_rpc_loop(core, comm, stream, dummy_address()).await?;
-        let res: Batch<SimpleMessage> = bytes_to_msg(&msg_rx.get())?;
+        let res: Batch<SimpleMessage> = bytes_to_msg(&msg_rx.get()).await?;
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].op.as_bytes(), b"stream-start");
 
@@ -422,7 +422,7 @@ mod tests {
         let (stream, msg_rx) = MemoryStream::new(packets_to_bytes(packets)?);
         let (core, comm, _rx) = dummy_ctx();
         generic_rpc_loop(core, comm, stream, dummy_address()).await?;
-        let res: Batch<RegisterWorkerResponseMsg> = bytes_to_msg(&msg_rx.get())?;
+        let res: Batch<RegisterWorkerResponseMsg> = bytes_to_msg(&msg_rx.get()).await?;
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].status.as_bytes(), b"OK");
 

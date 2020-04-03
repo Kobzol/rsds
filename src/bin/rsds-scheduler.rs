@@ -110,7 +110,7 @@ async fn main() -> rsds::Result<()> {
 
     let (comm, sender, receiver) = prepare_scheduler_comm();
 
-    let msd = Duration::from_millis(opt.msd);
+    let msd = Duration::from_micros(opt.msd);
     let scheduler_thread = thread::spawn(move || {
         let mut runtime = tokio::runtime::Builder::new()
             .basic_scheduler()

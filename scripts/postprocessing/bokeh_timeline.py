@@ -1,8 +1,8 @@
 import collections
-import math
 
 import pandas as pd
 from bokeh.models import ColumnDataSource, HoverTool
+from bokeh.palettes import d3
 
 TaskStartTraceEvent = collections.namedtuple("TaskStart", ["time", "worker", "task"])
 TaskEndTraceEvent = collections.namedtuple("TaskEnd", ["time", "worker", "task"])
@@ -52,7 +52,7 @@ def format_bytes(size):
 
 def task_tooltip(task) -> str:
     return f"id: {task.id}, key: {task.key}, duration: {task.duration:.3f} s, wait: {task.wait_duration:.3f} s, " \
-           f"size: {format_bytes(task.size)}, inputs: {len(task.inputs)}, "\
+           f"size: {format_bytes(task.size)}, inputs: {len(task.inputs)}, " \
            f"input_size: {format_bytes(task.input_bytes())}"
 
 
@@ -90,10 +90,8 @@ def build_task_locations(trace_events, worker):
     )
 
 
-def plot_tasks_on_workers(trace_events, workers):
+def plot_tasks_on_workers(trace_events, end_time, workers):
     from bokeh import plotting
-
-    end_time = math.ceil(max((e.time for e in trace_events), default=0))
 
     tools_to_show = 'hover,box_zoom,pan,save,reset,wheel_zoom'
     plot = plotting.figure(plot_width=1600, plot_height=850,
@@ -140,7 +138,47 @@ def plot_tasks_on_workers(trace_events, workers):
     return plot
 
 
-def plot_task_lifespan(tasks, end_time, packets, task_filter=None):
+def plot_packets(plot, packets):
+    packets = pd.DataFrame(packets)
+    packets["y"] = -1
+    packets["color"] = packets["event"].apply(lambda e: "red" if e == "packet-receive" else "blue")
+    packets["size_format"] = packets["size"].apply(lambda s: format_bytes(s))
+
+    packets = ColumnDataSource(data=packets)
+    plot.circle(source=packets, size=10, x="time", y="y", color="color", fill_color="color", name="packets")
+
+    plot.add_tools(
+        HoverTool(tooltips=[("Size", "@size_format"), ("Type", "@event"), ("Time", "@time")], names=["packets"]))
+
+
+def plot_profiles(plot, profiles):
+    profiles = pd.DataFrame(profiles)
+
+    methods = sorted(profiles["method"].unique())
+
+    palette = d3["Category20"][20]
+    profiles["left"] = profiles["start"]
+    profiles["right"] = profiles["start"] + profiles["duration"]
+
+    base = -2
+    height = 50
+    profiles["color"] = profiles["method"].apply(lambda r: palette[methods.index(r) % len(palette)])
+    profiles["top"] = profiles["method"].apply(lambda r: base - (height * methods.index(r)))
+    profiles["bottom"] = profiles["top"].apply(lambda r: r - height)
+    profiles["start"] = profiles["start"].apply(lambda r: f"{r:.5f}")
+    profiles["duration"] = profiles["duration"].apply(lambda r: f"{r:.5f}")
+
+    profiles = ColumnDataSource(data=profiles)
+    plot.quad(source=profiles, left="left", right="right", bottom="bottom", top="top", legend_field="method",
+              line_color="color", fill_color="color", name="profiles")
+
+    plot.add_tools(
+        HoverTool(
+            tooltips=[("Process", "@process"), ("Method", "@method"), ("Start", "@start"), ("Duration", "@duration")],
+            names=["profiles"]))
+
+
+def plot_task_lifespan(tasks, end_time, packets, profiles, task_filter=None):
     from bokeh import plotting
 
     tools_to_show = 'box_zoom,pan,save,reset,wheel_zoom'
@@ -160,7 +198,8 @@ def plot_task_lifespan(tasks, end_time, packets, task_filter=None):
         "compute-start": "pink",
         "compute-end": "blue",
         "finish": "black",
-        "remove": "red"
+        "remove": "red",
+        "steal": "red"
     }
     data = collections.defaultdict(lambda: [])
 
@@ -198,19 +237,12 @@ def plot_task_lifespan(tasks, end_time, packets, task_filter=None):
     plot.quad(source=source, left="left", right="right", bottom="bottom", top="top", line_color="color",
               fill_color="color", legend_field="event", name="tasks")
 
-    packets = pd.DataFrame(packets)
-    packets["y"] = -1
-    packets["color"] = packets["event"].apply(lambda e: "red" if e == "packet-receive" else "blue")
-    packets["size_format"] = packets["size"].apply(lambda s: format_bytes(s))
-
-    packets = ColumnDataSource(data=packets)
-    plot.circle(source=packets, size=10, x="time", y="y", color="color", fill_color="color", name="packets")
+    # plot_packets(plot, packets)
+    plot_profiles(plot, profiles)
 
     plot.add_tools(
         HoverTool(tooltips=[("Task", "@task"), ("Event", "@event"), ("Time", "@time"), ("Worker", "@worker")],
                   names=["tasks"]))
-    plot.add_tools(
-        HoverTool(tooltips=[("Size", "@size_format"), ("Type", "@event"), ("Time", "@time")], names=["packets"]))
 
     return plot
 

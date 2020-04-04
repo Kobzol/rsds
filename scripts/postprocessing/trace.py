@@ -154,23 +154,45 @@ def generate_timeline(trace_path, output, task_filter=None):
     first_timestamp = None
     max_normalized_time = 0
     packets = defaultdict(lambda: [])
+    profiles = defaultdict(lambda: [])
+    methods_in_progress = {}
 
     def normalize_time(fields, timestamp):
         nonlocal first_timestamp, max_normalized_time
 
         timestamp = time_us_to_s(timestamp)
 
-        if fields["action"] == "task" and first_timestamp is None:
+        if fields["action"] != "task" and first_timestamp is None:
+            if fields["action"] == "new-worker":
+                return timestamp
+            return None
+
+        if first_timestamp is None:
             first_timestamp = timestamp
 
-        if first_timestamp is not None:
-            timestamp -= first_timestamp
-            max_normalized_time = max(max_normalized_time, timestamp)
-        assert timestamp >= 0
+        timestamp -= first_timestamp
+        max_normalized_time = max(max_normalized_time, timestamp)
         return timestamp
 
     def handle_event(timestamp, fields, tasks, workers):
         action = fields["action"]
+        if action == "steal":
+            task = tasks[fields["task"]]
+            task.add_event("steal", timestamp)
+        if action == "measure":
+            method = fields["method"]
+            start = fields["event"] == "start"
+            if start:
+                assert method not in methods_in_progress
+                methods_in_progress[method] = timestamp
+            elif method in methods_in_progress:
+                duration = timestamp - methods_in_progress[method]
+                profiles["process"].append(fields["process"])
+                profiles["method"].append(method)
+                profiles["start"].append(methods_in_progress[method])
+                profiles["duration"].append(duration)
+                del methods_in_progress[method]
+
         if action == "task" and fields["event"] == "finish":
             start = normalize_time(fields, fields["start"])
             end = normalize_time(fields, fields["stop"])
@@ -185,14 +207,15 @@ def generate_timeline(trace_path, output, task_filter=None):
             packets["time"].append(timestamp)
 
     tasks, workers = parse_trace(trace_path, handle_event, normalize_time=normalize_time)
+    assert len(methods_in_progress) == 0
 
     events = normalize_task_events(events)
     worker_list = sorted(workers.values(), key=lambda w: w.id)
 
     def plot_fn():
         return plot_tabs([
-            (lambda: plot_task_lifespan(tasks, max_normalized_time, packets, task_filter), "Task lifespan"),
-            (lambda: plot_tasks_on_workers(events, worker_list), "Tasks on workers"),
+            (lambda: plot_task_lifespan(tasks, max_normalized_time, packets, profiles, task_filter), "Task lifespan"),
+            (lambda: plot_tasks_on_workers(events, max_normalized_time, worker_list), "Tasks on workers"),
         ])
 
     build_plot(plot_fn, output)
@@ -222,10 +245,6 @@ def generate_trace_charts(trace_path, output):
         sns.lineplot(x=times, y=counts)
     plt.legend(labels=events)
     plt.show()
-
-
-
-
 
 
 def generate_graph(trace_path, output):
@@ -348,6 +367,8 @@ def parse_trace(trace_path, handle_event, normalize_time=None) -> Tuple[Dict[int
 
             fields = record["fields"]
             timestamp = normalize_time(fields, int(record["timestamp"]))
+            if timestamp is None:
+                continue
             action = fields["action"]
 
             if action == "task":

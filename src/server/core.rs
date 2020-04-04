@@ -308,7 +308,7 @@ impl Core {
                             assignment.worker,
                             wref1.get().id
                         );
-                        trace_debug("steal while another steal is in progress");
+                        trace_worker_steal(task.id, wref1.get().id, assignment.worker);
                         TaskRuntimeState::Stealing(wref1.clone(), worker_ref)
                     }
                     TaskRuntimeState::Finished(_, _)

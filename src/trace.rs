@@ -157,6 +157,14 @@ pub fn trace_packet_receive(size: usize) {
     tracing::info!(action = "packet-receive", size = size);
 }
 
+#[inline(always)]
+pub fn trace_debug(message: &str) {
+    tracing::info!(
+        action = "debug",
+        message = message,
+    );
+}
+
 struct FileGuard(Arc<Mutex<std::fs::File>>);
 impl std::io::Write for FileGuard {
     #[inline]

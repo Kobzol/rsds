@@ -9,10 +9,7 @@ use crate::server::client::{Client, ClientId};
 use crate::protocol::key::{dask_key_ref_to_str, dask_key_ref_to_string, DaskKey, DaskKeyRef};
 use crate::server::task::{DataInfo, ErrorInfo, Task, TaskRef, TaskRuntimeState};
 use crate::server::worker::WorkerRef;
-use crate::trace::{
-    trace_task_assign, trace_task_finish, trace_task_place, trace_task_remove, trace_worker_new,
-    trace_worker_steal, trace_worker_steal_response, trace_worker_steal_response_missing,
-};
+use crate::trace::{trace_task_assign, trace_task_finish, trace_task_place, trace_task_remove, trace_worker_new, trace_worker_steal, trace_worker_steal_response, trace_worker_steal_response_missing, trace_debug};
 
 impl Identifiable for Client {
     type Id = ClientId;
@@ -256,6 +253,7 @@ impl Core {
         notifications: &mut Notifications,
     ) {
         log::debug!("Assignments from scheduler: {:?}", assignments);
+        trace_debug(&format!("processing {} assignments", assignments.len()));
         for assignment in assignments {
             let worker_ref = self
                 .workers
@@ -277,6 +275,7 @@ impl Core {
                             self.compute_task(worker_ref.clone(), task_ref.clone(), notifications);
                             TaskRuntimeState::Assigned(worker_ref)
                         } else {
+                            trace_debug("assigning task which is not ready");
                             log::debug!(
                                 "Task task={} scheduled to worker={}",
                                 assignment.task,
@@ -298,6 +297,7 @@ impl Core {
                             notifications.steal_task_from_worker(wref.clone(), task_ref.clone());
                             TaskRuntimeState::Stealing(wref.clone(), worker_ref)
                         } else {
+                            trace_debug("assigning repeatedly to same task");
                             TaskRuntimeState::Assigned(wref.clone())
                         }
                     }
@@ -308,11 +308,13 @@ impl Core {
                             assignment.worker,
                             wref1.get().id
                         );
+                        trace_debug("steal while another steal is in progress");
                         TaskRuntimeState::Stealing(wref1.clone(), worker_ref)
                     }
                     TaskRuntimeState::Finished(_, _)
                     | TaskRuntimeState::Released
                     | TaskRuntimeState::Error(_) => {
+                        trace_debug("assigning finished task");
                         log::debug!("Rescheduling non-active task={}", assignment.task);
                         continue;
                     }
